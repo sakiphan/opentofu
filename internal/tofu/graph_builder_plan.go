@@ -180,7 +180,13 @@ func (b *PlanGraphBuilder) Steps() []GraphTransformer {
 			Concrete: b.ConcreteResourceOrphan,
 			State:    b.State,
 			Config:   b.Config,
-			skip:     b.Operation == walkPlanDestroy,
+
+			// Resources targeted by import blocks are not orphans when
+			// configuration is being generated for them during planning.
+			importTargets:      b.ImportTargets,
+			generateConfigPath: b.GenerateConfigPath,
+
+			skip: b.Operation == walkPlanDestroy,
 		},
 
 		// We also need nodes for any deposed instance objects present in the

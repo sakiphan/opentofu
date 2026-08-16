@@ -379,6 +379,22 @@ func (n *NodePlannableResourceInstance) managedResourceExecute(ctx context.Conte
 	// Plan the instance, unless we're in the refresh-only mode
 	expander := evalCtx.InstanceExpander()
 	if !n.skipPlanChanges {
+		// If this resource is targeted by an import block but already exists
+		// in state, the import above is skipped as a no-op, and so no
+		// configuration was generated for it during importState. The node
+		// still has no configuration at this point, since it is only part of
+		// the graph because of the import block. Generate the configuration
+		// from the current state now, so that planning below can proceed and
+		// the user still gets the configuration they asked for.
+		// See https://github.com/opentofu/opentofu/issues/4456
+		if !importing && n.Config == nil && len(n.generateConfigPath) > 0 && instanceRefreshState != nil {
+			diags = diags.Append(n.generateConfig(instanceRefreshState, providerSchema))
+			if n.Config == nil {
+				// Config generation failed in a way that prevents planning
+				// from continuing for this resource.
+				return diags
+			}
+		}
 
 		// add this instance to n.forceReplace if replacement is triggered by
 		// another change
@@ -712,46 +728,11 @@ func (n *NodePlannableResourceInstance) importState(ctx context.Context, evalCtx
 			return instanceRefreshState, diags.Append(fmt.Errorf("tried to generate config for %s, but it already exists", n.Addr))
 		}
 
-		schema, _ := providerSchema.SchemaForResourceAddr(n.Addr.Resource.Resource)
-		if schema == nil {
-			// Should be caught during validation, so we don't bother with a pretty error here
-			diags = diags.Append(fmt.Errorf("provider does not support resource type for %q", n.Addr))
+		diags = diags.Append(n.generateConfig(instanceRefreshState, providerSchema))
+		if n.Config == nil {
+			// Config generation failed in a way that prevents planning
+			// from continuing for this resource.
 			return instanceRefreshState, diags
-		}
-
-		// Generate the HCL string first, then parse the HCL body from it.
-		// First we generate the contents of the resource block for use within
-		// the planning node. Then we wrap it in an enclosing resource block to
-		// pass into the plan for rendering.
-		generatedHCLAttributes, generatedDiags := n.generateHCLStringAttributes(n.Addr, instanceRefreshState, schema.Block)
-		diags = diags.Append(generatedDiags)
-
-		n.generatedConfigHCL = genconfig.WrapResourceContents(n.Addr, generatedHCLAttributes)
-
-		// parse the "file" as HCL to get the hcl.Body
-		synthHCLFile, hclDiags := hclsyntax.ParseConfig([]byte(generatedHCLAttributes), filepath.Base(n.generateConfigPath), hcl.Pos{Byte: 0, Line: 1, Column: 1})
-		diags = diags.Append(hclDiags)
-		if hclDiags.HasErrors() {
-			return instanceRefreshState, diags
-		}
-
-		// We have to do a kind of mini parsing of the content here to correctly
-		// mark attributes like 'provider' as hidden. We only care about the
-		// resulting content, so it's remain that gets passed into the resource
-		// as the config.
-		_, remain, resourceDiags := synthHCLFile.Body.PartialContent(configs.ResourceBlockSchema)
-		diags = diags.Append(resourceDiags)
-		if resourceDiags.HasErrors() {
-			return instanceRefreshState, diags
-		}
-
-		n.Config = &configs.Resource{
-			Mode:     addrs.ManagedResourceMode,
-			Type:     n.Addr.Resource.Resource.Type,
-			Name:     n.Addr.Resource.Resource.Name,
-			Config:   remain,
-			Managed:  &configs.ManagedResource{},
-			Provider: n.ResolvedProvider.ProviderConfig.Provider,
 		}
 	}
 
@@ -768,6 +749,59 @@ func (n *NodePlannableResourceInstance) shouldImport(evalCtx EvalContext) bool {
 	// for it
 	state := evalCtx.State()
 	return state.ResourceInstance(n.ResourceInstanceAddr()) == nil
+}
+
+// generateConfig generates configuration from the given resource instance
+// state for a resource that has no configuration of its own, storing the
+// generated HCL string on the node for rendering in the plan, and installing
+// the parsed configuration body on the node so that planning can proceed.
+// It must only be called when the node has no configuration yet and a config
+// generation path was requested.
+func (n *NodePlannableResourceInstance) generateConfig(state *states.ResourceInstanceObject, providerSchema providers.ProviderSchema) tfdiags.Diagnostics {
+	var diags tfdiags.Diagnostics
+
+	schema, _ := providerSchema.SchemaForResourceAddr(n.Addr.Resource.Resource)
+	if schema == nil {
+		// Should be caught during validation, so we don't bother with a pretty error here
+		return diags.Append(fmt.Errorf("provider does not support resource type for %q", n.Addr))
+	}
+
+	// Generate the HCL string first, then parse the HCL body from it.
+	// First we generate the contents of the resource block for use within
+	// the planning node. Then we wrap it in an enclosing resource block to
+	// pass into the plan for rendering.
+	generatedHCLAttributes, generatedDiags := n.generateHCLStringAttributes(n.Addr, state, schema.Block)
+	diags = diags.Append(generatedDiags)
+
+	n.generatedConfigHCL = genconfig.WrapResourceContents(n.Addr, generatedHCLAttributes)
+
+	// parse the "file" as HCL to get the hcl.Body
+	synthHCLFile, hclDiags := hclsyntax.ParseConfig([]byte(generatedHCLAttributes), filepath.Base(n.generateConfigPath), hcl.Pos{Byte: 0, Line: 1, Column: 1})
+	diags = diags.Append(hclDiags)
+	if hclDiags.HasErrors() {
+		return diags
+	}
+
+	// We have to do a kind of mini parsing of the content here to correctly
+	// mark attributes like 'provider' as hidden. We only care about the
+	// resulting content, so it's remain that gets passed into the resource
+	// as the config.
+	_, remain, resourceDiags := synthHCLFile.Body.PartialContent(configs.ResourceBlockSchema)
+	diags = diags.Append(resourceDiags)
+	if resourceDiags.HasErrors() {
+		return diags
+	}
+
+	n.Config = &configs.Resource{
+		Mode:     addrs.ManagedResourceMode,
+		Type:     n.Addr.Resource.Resource.Type,
+		Name:     n.Addr.Resource.Resource.Name,
+		Config:   remain,
+		Managed:  &configs.ManagedResource{},
+		Provider: n.ResolvedProvider.ProviderConfig.Provider,
+	}
+
+	return diags
 }
 
 // generateHCLStringAttributes produces a string in HCL format for the given

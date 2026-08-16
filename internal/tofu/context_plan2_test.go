@@ -7863,6 +7863,97 @@ import {
 	})
 }
 
+func TestContext2Plan_importResourceConfigGenResourceAlreadyInState(t *testing.T) {
+	SkipExperimental(t, ExperimentalFeatureImport)
+
+	addr := mustResourceInstanceAddr("test_object.a")
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+import {
+  to   = test_object.a
+  id   = "123"
+}
+`,
+	})
+
+	p := simpleMockProvider()
+	ctx := testContext2(t, &ContextOpts{
+		Plugins: plugins.NewLibrary(map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		}, nil),
+	})
+	p.ReadResourceResponse = &providers.ReadResourceResponse{
+		NewState: cty.ObjectVal(map[string]cty.Value{
+			"test_string": cty.StringVal("foo"),
+		}),
+	}
+	p.ImportResourceStateResponse = &providers.ImportResourceStateResponse{
+		ImportedResources: []providers.ImportedResource{
+			{
+				TypeName: "test_object",
+				State: cty.ObjectVal(map[string]cty.Value{
+					"test_string": cty.StringVal("foo"),
+				}),
+			},
+		},
+	}
+
+	state := states.NewState()
+	root := state.EnsureModule(addrs.RootModuleInstance)
+	root.SetResourceInstanceCurrent(
+		mustResourceInstanceAddr("test_object.a").Resource,
+		&states.ResourceInstanceObjectSrc{
+			Status:    states.ObjectReady,
+			AttrsJSON: []byte(`{"test_string":"foo"}`),
+		},
+		mustProviderConfig(`provider["registry.opentofu.org/hashicorp/test"]`),
+		addrs.NoKey,
+	)
+
+	plan, diags := ctx.Plan(context.Background(), m, state, &PlanOpts{
+		Mode:               plans.NormalMode,
+		GenerateConfigPath: "generated.tf", // Actual value here doesn't matter, as long as it is not empty.
+	})
+	if diags.HasErrors() {
+		t.Fatalf("unexpected errors\n%s", diags.Err().Error())
+	}
+
+	t.Run(addr.String(), func(t *testing.T) {
+		instPlan := plan.Changes.ResourceInstance(addr)
+		if instPlan == nil {
+			t.Fatalf("no plan for %s at all", addr)
+		}
+
+		if got, want := instPlan.Addr, addr; !got.Equal(want) {
+			t.Errorf("wrong current address\ngot:  %s\nwant: %s", got, want)
+		}
+		if got, want := instPlan.PrevRunAddr, addr; !got.Equal(want) {
+			t.Errorf("wrong previous run address\ngot:  %s\nwant: %s", got, want)
+		}
+		if got, want := instPlan.Action, plans.NoOp; got != want {
+			t.Errorf("wrong planned action\ngot:  %s\nwant: %s", got, want)
+		}
+		if got, want := instPlan.ActionReason, plans.ResourceInstanceChangeNoReason; got != want {
+			t.Errorf("wrong action reason\ngot:  %s\nwant: %s", got, want)
+		}
+		if instPlan.Importing != nil {
+			t.Errorf("expected non-import change, got import change %+v", instPlan.Importing)
+		}
+
+		want := `resource "test_object" "a" {
+  test_bool   = null
+  test_list   = null
+  test_map    = null
+  test_number = null
+  test_string = "foo"
+}`
+		got := instPlan.GeneratedConfig
+		if diff := cmp.Diff(want, got); len(diff) > 0 {
+			t.Errorf("got:\n%s\nwant:\n%s\ndiff:\n%s", got, want, diff)
+		}
+	})
+}
+
 func TestContext2Plan_importResourceConfigGenWithAlias(t *testing.T) {
 	SkipExperimental(t, ExperimentalFeatureImport)
 

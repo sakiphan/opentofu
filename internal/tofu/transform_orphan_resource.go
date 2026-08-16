@@ -9,6 +9,7 @@ import (
 	"context"
 	"log"
 
+	"github.com/opentofu/opentofu/internal/addrs"
 	"github.com/opentofu/opentofu/internal/configs"
 	"github.com/opentofu/opentofu/internal/dag"
 	"github.com/opentofu/opentofu/internal/states"
@@ -32,6 +33,17 @@ type OrphanResourceInstanceTransformer struct {
 	// Config is the root node in the configuration tree. We'll look up
 	// the appropriate note in this tree using the path in each node.
 	Config *configs.Config
+
+	// importTargets specifies a slice of addresses that will have state
+	// imported for them.
+	importTargets []*ImportTarget
+
+	// generateConfigPath tells the graph that configuration should be
+	// generated for import targets that don't have a corresponding
+	// resource in the configuration. Those resources are not treated as
+	// orphans even though they have no configuration, since it will be
+	// generated for them during planning.
+	generateConfigPath string
 
 	// Do not apply this transformer
 	skip bool
@@ -63,6 +75,24 @@ func (t *OrphanResourceInstanceTransformer) Transform(_ context.Context, g *Grap
 	return nil
 }
 
+// isTargetedForImport checks whether the given state resource is targeted by
+// an import block while configuration is being generated during planning, in
+// which case it must not be treated as an orphan: the plannable resource node
+// added for the import target generates configuration for it and plans it.
+func (t *OrphanResourceInstanceTransformer) isTargetedForImport(addr addrs.AbsResource) bool {
+	if len(t.generateConfigPath) == 0 {
+		return false
+	}
+
+	configAddr := addr.Config()
+	for _, target := range t.importTargets {
+		if target.StaticAddr().Equal(configAddr) {
+			return true
+		}
+	}
+	return false
+}
+
 func (t *OrphanResourceInstanceTransformer) transform(g *Graph, ms *states.Module) error {
 	if ms == nil {
 		return nil
@@ -90,6 +120,15 @@ func (t *OrphanResourceInstanceTransformer) transform(g *Graph, ms *states.Modul
 			if r := m.ResourceByAddr(rs.Addr.Resource); r != nil {
 				continue
 			}
+		}
+
+		// A resource that is targeted by an import block is not an orphan,
+		// even though it has no configuration, if configuration is being
+		// generated for it during planning: the plannable resource node
+		// added for the import target handles it instead.
+		if t.isTargetedForImport(rs.Addr) {
+			log.Printf("[TRACE] OrphanResourceInstanceTransformer: skipping import target %s, configuration will be generated for it", rs.Addr)
+			continue
 		}
 
 		for key, inst := range rs.Instances {
